@@ -834,10 +834,8 @@ def create_test_woo(
         api_key: Optional[ApiKey] = None,
         secret: Optional[ApiSecret] = None,
 ) -> Woo:
-    if api_key is None:
-        api_key = make_api_key()
-    if secret is None:
-        secret = make_api_secret()
+    api_key = make_api_key() if api_key is None else api_key
+    secret = make_api_secret() if secret is None else secret
 
     return Woo(
         name='woo',

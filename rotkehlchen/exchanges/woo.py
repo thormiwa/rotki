@@ -17,7 +17,12 @@ from rotkehlchen.constants import ZERO
 from rotkehlchen.errors.asset import UnknownAsset, UnsupportedAsset
 from rotkehlchen.errors.misc import RemoteError
 from rotkehlchen.errors.serialization import DeserializationError
-from rotkehlchen.exchanges.data_structures import AssetMovement, Trade, TradeType
+from rotkehlchen.exchanges.data_structures import (
+    AssetMovement,
+    AssetMovementCategory,
+    Trade,
+    TradeType,
+)
 from rotkehlchen.exchanges.exchange import ExchangeInterface, ExchangeQueryBalances
 from rotkehlchen.history.deserialization import deserialize_price
 from rotkehlchen.inquirer import Inquirer
@@ -28,7 +33,6 @@ from rotkehlchen.user_messages import MessagesAggregator
 from rotkehlchen.utils.misc import ts_now_in_ms, ts_sec_to_ms
 from rotkehlchen.utils.mixins.cacheable import cache_response_timewise
 from rotkehlchen.utils.mixins.lockable import protect_with_lock
-from rotkehlchen.utils.serialization import jsonloads_dict
 
 if TYPE_CHECKING:
     from rotkehlchen.db.dbhandler import DBHandler
@@ -108,7 +112,7 @@ class Woo(ExchangeInterface):
     @protect_with_lock()
     @cache_response_timewise()
     def query_balances(self) -> ExchangeQueryBalances:
-        """Return the account balances on Woo """
+        """Return the account balances on Woo"""
         response = self._api_query('v3/balances')
 
         if response.status_code != HTTPStatus.OK:
@@ -118,7 +122,7 @@ class Woo(ExchangeInterface):
             )
             return result, msg
         try:
-            response_dict = jsonloads_dict(response.text)
+            response_dict: dict = response.json()
         except JSONDecodeError as e:
             msg = f'Woo returned invalid JSON response: {response.text}.'
             log.error(msg)
@@ -130,6 +134,7 @@ class Woo(ExchangeInterface):
             self,
             response_dict: dict[str, Any],
     ) -> dict[AssetWithOracles, Balance]:
+        """Deserialize a Woo balances returned from the API to Balance"""
         try:
             balances = response_dict['data']['holding']
         except KeyError as e:
@@ -139,9 +144,9 @@ class Woo(ExchangeInterface):
 
         assets_balance: defaultdict[AssetWithOracles, Balance] = defaultdict(Balance)
         for entry in balances:
-            symbol = entry.get('token')
+            symbol = entry['token']
             try:
-                amount = deserialize_asset_amount(entry.get('holding') + entry.get('staked'))
+                amount = deserialize_asset_amount(entry.get('holding', 0) + entry.get('staked', 0))
                 if amount == ZERO:
                     continue
                 asset = asset_from_woo(symbol)
@@ -152,7 +157,7 @@ class Woo(ExchangeInterface):
                     error=str(e),
                 )
                 self.msg_aggregator.add_error(
-                    'Failed to deserialize a Woo balance. '
+                    'Failed to deserialize a Woo balance entry for symbol {symbol}.'
                     'Check logs for details. Ignoring it.',
                 )
                 continue
@@ -180,13 +185,15 @@ class Woo(ExchangeInterface):
 
         return dict(assets_balance)
 
-    def _deserialize_trade(
-            self,
-            trade: dict[str, Any],
-    ) -> Trade:
+    def _deserialize_trade(self, trade: dict[str, Any]) -> Trade:
         """Deserialize a Woo trade returned from the API to History Event"""
         symbol = trade['symbol']
-        _, base_asset_symbol, quote_asset_symbol = symbol.split('_')
+        try:
+            _, base_asset_symbol, quote_asset_symbol = symbol.split('_')
+        except ValueError as e:
+            raise DeserializationError(
+                f'Could not split symbol {symbol} into base and quote asset',
+            ) from e
         base_asset = asset_from_woo(base_asset_symbol)
         quote_asset = asset_from_woo(quote_asset_symbol)
         side = trade['side']
@@ -215,7 +222,6 @@ class Woo(ExchangeInterface):
             end_ts: Timestamp,
     ) -> tuple[list[Trade], tuple[Timestamp, Timestamp]]:
         """Return trade history on Woo in a range of time."""
-
         trades: list[Trade] = self._api_query_paginated(
             start_ts=start_ts,
             end_ts=end_ts,
@@ -224,15 +230,33 @@ class Woo(ExchangeInterface):
         )
         return trades, (start_ts, end_ts)
 
+    def query_online_deposits_withdrawals(
+            self,
+            start_ts: Timestamp,
+            end_ts: Timestamp,
+    ) -> tuple[list[AssetMovement], tuple[Timestamp, Timestamp]]:
+        """Return deposits/withdrawals history on Woo in a range of time."""
+        movements: list[AssetMovement] = self._api_query_paginated(
+            start_ts=start_ts,
+            end_ts=end_ts,
+            options={'limit': API_MAX_LIMIT},
+            case='asset_movements',
+        )
+        return movements, (start_ts, end_ts)
+
     def validate_api_key(self) -> tuple[bool, str]:
         """Validates that the Woo API key is good for usage in rotki"""
-        response = self._api_query('v1/client/trades')
+        try:
+            response = self._api_query('v1/client/trades', options={'limit': 1})
+        except RemoteError as e:
+            return False, str(e)
         if response.status_code != HTTPStatus.OK:
             result, msg = self._process_unsuccessful_response(
                 response=response,
                 case='validate_api_key',
             )
             return result, msg
+
         return True, ''
 
     def _api_query(
@@ -256,7 +280,6 @@ class Woo(ExchangeInterface):
             'x-api-signature': signature,
             'x-api-timestamp': timestamp,
         })
-
         log.debug('Woo API request', request_url=request_url, options=options)
         try:
             response = self.session.request(
@@ -311,17 +334,27 @@ class Woo(ExchangeInterface):
             'start_t': ts_sec_to_ms(start_ts),
         }
         while True:
-            response = self._api_query(
-                endpoint=endpoint,
-                options=call_options,
-            )
+            try:
+                response = self._api_query(
+                    endpoint=endpoint,
+                    options=call_options,
+                )
+            except RemoteError as e:
+                log.error(
+                    f'Woo {case} query failed due to a remote error: {e!s}',
+                    options=call_options,
+                )
+                self.msg_aggregator.add_error(
+                    f'Got remote error while querying {self.name} {case}: {e!s}',
+                )
+                return []
             if response.status_code != HTTPStatus.OK:
                 return self._process_unsuccessful_response(
                     response=response,
                     case=case,
                 )
             try:
-                response_data = jsonloads_dict(response.text)
+                response_data: dict = response.json()
             except JSONDecodeError:
                 msg = f'{self.name} {case} returned an invalid JSON response: {response.text}.'
                 log.error(msg, options=call_options)
@@ -329,31 +362,78 @@ class Woo(ExchangeInterface):
                     f'Got remote error while querying {self.name} {case}: {msg}',
                 )
                 return []
-            deserialization_method = self._deserialize_trade
-            entries = response_data['data']
+            if case == 'trades':
+                deserialization_method = self._deserialize_trade
+                entries = response_data['data']
 
-            for entry in entries:
-                try:
-                    result = deserialization_method(entry)
+                for entry in entries:
+                    try:
+                        result = deserialization_method(entry)
+                    except DeserializationError as e:
+                        log.error(
+                            'Error processing a Woo balance.',
+                            entry=entry,
+                            error=str(e),
+                        )
                     results.append(result)
-                except DeserializationError as e:
-                    log.error(
-                        'Error processing a Woo balance.',
-                        entry=entry,
-                        error=str(e),
-                    )
-            if len(entries) < call_options['limit']:
-                break
-            call_options['fromId'] = entries[-1]['id']
-
+                if len(entries) < call_options['limit']:
+                    break
+                call_options['fromId'] = entries[-1]['id']
+            elif case == 'asset_movements':
+                deserialization_method = self._deserialize_asset_movement
+                entries = response_data['rows']
+                for entry in entries:
+                    try:
+                        result = deserialization_method(entry)
+                    except DeserializationError as e:
+                        log.error(
+                            'Error processing a Woo balance.',
+                            entry=entry,
+                            error=str(e),
+                        )
+                    results.append(result)
+                if len(entries) < call_options['limit']:
+                    break
+                call_options['fromId'] = entries[-1]['id']
         return results
+
+    def _deserialize_asset_movement(self, movement: dict[str, Any]) -> AssetMovement:
+        """Deserialize a Woo asset movement returned from the API to AssetMovement"""
+        try:
+            asset = asset_from_woo(movement['token'])
+        except (UnknownAsset, UnsupportedAsset) as e:
+            asset_tag = 'unknown' if isinstance(e, UnknownAsset) else 'unsupported'
+            self.msg_aggregator.add_warning(
+                f'Found {asset_tag} {self.name} asset {e.identifier} due to: {e}.'
+                f'Ignoring its balance query.',
+            )
+        movement_id = str(movement['id'])
+        timestamp = Timestamp(int(float(movement['created_time'])))
+        amount = deserialize_asset_amount(movement['amount'])
+        fee = deserialize_fee(movement['fee_amount'])
+        transaction_id = movement['tx_id']
+        address = movement['target_address']
+        fee_currency = asset_from_woo(movement['fee_token'])
+        category = AssetMovementCategory.DEPOSIT if movement['token_side'] == 'DEPOSIT' else AssetMovementCategory.WITHDRAWAL  # noqa: E501
+        return AssetMovement(
+            location=Location.WOO,
+            category=category,
+            timestamp=timestamp,
+            address=address,
+            transaction_id=transaction_id,
+            asset=asset,
+            amount=amount,
+            fee_asset=fee_currency,
+            fee=fee,
+            link=movement_id,
+        )
 
     @overload
     def _process_unsuccessful_response(
             self,
             response: Response,
             case: Literal['validate_api_key'],
-    ) -> tuple[Literal[False], str]:
+    ) -> tuple[bool, str]:
         ...
 
     @overload
@@ -389,16 +469,15 @@ class Woo(ExchangeInterface):
         tuple[Literal[False], str],
         ExchangeQueryBalances,
     ]:
-        """This function processes not successful responses for the following
-        cases listed in `case`.
+        """This function processes unsuccessful responses for the following
+        cases listed in `case` argument.
         """
         case_pretty = case.replace('_', ' ')  # human readable case
         try:
-            response_dict = jsonloads_dict(response.text)
-        except JSONDecodeError as e:
-            msg = f'{self.name} returned invalid JSON response: {response.text}.'
+            response_dict: dict = response.json()
+        except JSONDecodeError:
+            msg = f'Woo returned invalid JSON response: {response.text}.'
             log.error(msg)
-
             if case in ('validate_api_key', 'balances'):
                 return False, msg
             if case in ('trades', 'asset_movements'):
@@ -406,8 +485,7 @@ class Woo(ExchangeInterface):
                     f'Got remote error while querying {self.name} {case}: {msg}',
                 )
                 return []
-
-            raise AssertionError(f'Unexpected {self.name} response_case: {case_pretty}.') from e
+            assert case in ('validate_api_key', 'balances', 'trades', 'asset_movements'), f'Unexpected {self.name} response_case in {case_pretty}'  # noqa: E501
 
         error_code = response_dict.get('code')
         if error_code in API_KEY_ERROR_CODE_ACTION:
@@ -415,17 +493,16 @@ class Woo(ExchangeInterface):
         else:
             reason = response_dict.get('reason') or response.text
             msg = (
-                f'{self.name} query responded with error status code: {response.status_code} '
+                f'Woo query responded with error status code: {response.status_code} '
                 f'and text: {reason}.'
             )
             log.error(msg)
-
         if case in ('validate_api_key', 'balances'):
             return False, msg
         if case in ('trades', 'asset_movements'):
             self.msg_aggregator.add_error(
-                f'Got remote error while querying {self.name} {case}: {msg}',
+                f'Woo {case_pretty} query failed: {msg}',
             )
+            assert case in ('trades', 'asset_movements')
             return []
-
-        raise AssertionError(f'Unexpected {self.name} response_case: {case_pretty}.')
+        return False, msg
