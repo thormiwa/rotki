@@ -20,6 +20,7 @@ from rotkehlchen.assets.exchanges_mappings.nexo import WORLD_TO_NEXO
 from rotkehlchen.assets.exchanges_mappings.okx import WORLD_TO_OKX
 from rotkehlchen.assets.exchanges_mappings.poloniex import WORLD_TO_POLONIEX
 from rotkehlchen.assets.exchanges_mappings.uphold import WORLD_TO_UPHOLD
+from rotkehlchen.assets.exchanges_mappings.woo import WORLD_TO_WOO
 from rotkehlchen.assets.utils import symbol_to_asset_or_token
 from rotkehlchen.constants.assets import A_DAI, A_SAI
 from rotkehlchen.constants.resolver import strethaddress_to_identifier
@@ -868,6 +869,7 @@ BITPANDA_TO_WORLD = {v: k for k, v in WORLD_TO_BITPANDA.items()}
 CRYPTOCOM_TO_WORLD = {v: k for k, v in WORLD_TO_CRYPTOCOM.items()}
 BLOCKFI_TO_WORLD = {v: k for k, v in WORLD_TO_BLOCKFI.items()}
 OKX_TO_WORLD = {v: k for k, v in WORLD_TO_OKX.items()}
+WOO_TO_WORLD = {v: k for k, v in WORLD_TO_WOO.items()}
 COMMON_IDENTIFIERS_TO_WORLD = {v: k for k, v in COMMON_ASSETS_MAPPINGS.items()}
 
 RENAMED_BINANCE_ASSETS = {
@@ -1201,6 +1203,18 @@ def asset_from_ftx(ftx_name: str) -> AssetWithOracles:
     return symbol_to_asset_or_token(name)
 
 
+def asset_from_woo(woo_name: str) -> AssetWithOracles:
+    """May raise:
+    - DeserializationError
+    - UnknownAsset
+    """
+    if not isinstance(woo_name, str):
+        raise DeserializationError(f'Got non-string type {type(woo_name)} for woo asset')
+
+    name = WOO_TO_WORLD.get(woo_name, woo_name)
+    return symbol_to_asset_or_token(name)
+
+
 def asset_from_common_identifier(common_identifier: str) -> AssetWithOracles:
     """May raise:
     - DeserializationError
@@ -1230,5 +1244,6 @@ LOCATION_TO_ASSET_MAPPING: dict[Location, Callable[[str], AssetWithOracles]] = {
     Location.NEXO: asset_from_nexo,
     Location.KUCOIN: asset_from_kucoin,
     Location.OKX: asset_from_okx,
+    Location.WOO: asset_from_woo,
     Location.EXTERNAL: asset_from_common_identifier,
 }
